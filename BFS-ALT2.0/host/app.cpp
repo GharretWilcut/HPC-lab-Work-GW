@@ -36,7 +36,6 @@ extern "C" {
 #define NR_DPUS 16
 static const uint32_t INF = UINT32_MAX;
 
-/* ================= TIMER ================= */
 
 static inline double now_sec() {
     struct timespec ts;
@@ -44,7 +43,6 @@ static inline double now_sec() {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-/* ================= CPU ENERGY (Intel RAPL) ================= */
 
 static double rapl_read_uj(const char *path) {
     FILE *f = fopen(path, "r");
@@ -69,7 +67,7 @@ static double rapl_delta_joules(double uj_before, double uj_after,
 #define RAPL_ENERGY_PATH  "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj"
 #define RAPL_MAX_PATH     "/sys/class/powercap/intel-rapl/intel-rapl:0/max_energy_range_uj"
 
-/* ================= TYPES ================= */
+//type definitions
 
 static inline uint32_t align_to_8(uint32_t x) {
     return (x + 7) & ~7;
@@ -103,7 +101,6 @@ struct LocalMeta {
     uint32_t numNodes;
 };
 
-/* ================= GRAPH LOADING ================= */
 
 static void read_edge_list(const char *filename,
                            std::vector<Edge> &edges,
@@ -119,8 +116,6 @@ static void read_edge_list(const char *filename,
     }
     fclose(f);
 }
-
-/* ================= VERIFY ================= */
 
 static void verify_levels_only(
     const std::vector<Edge> &edges,
@@ -148,13 +143,13 @@ static void verify_levels_only(
     printf("==============================\n\n");
 }
 
-/* ================= CPU-ONLY BFS (energy baseline) ================= */
 
 static double cpu_bfs_energy(
     const std::vector<Edge> &edges,
     uint32_t numNodes,
     int verbosity)
 {
+    
 #if ENERGY
     if (verbosity >= 1)
         printf("Running CPU-only BFS for energy baseline...\n");
@@ -238,9 +233,9 @@ int main(int argc, char **argv)
     globalLevel[root].value  = 0;
     globalParent[root].value = root;
 
-#if ENERGY
+    #if ENERGY
     double cpuBFSEnergy = cpu_bfs_energy(edges, numGlobalNodes, verbosity);
-#endif
+    #endif
 
   
 
@@ -248,11 +243,11 @@ int main(int argc, char **argv)
     DPU_ASSERT(dpu_alloc(NR_DPUS, NULL, &dpuSet));
     DPU_ASSERT(dpu_load(dpuSet, DPU_BINARY, NULL));
 
-#if ENERGY
+    #if ENERGY
     dpu_probe_t probe;
     double totalDPUEnergy = 0.0;
     DPU_ASSERT(dpu_probe_init(&probe));
-#endif
+    #endif
 
     std::vector<LocalMeta> meta(NR_DPUS);
 
@@ -336,20 +331,20 @@ int main(int argc, char **argv)
 
     if (verbosity >= 1) {
         printf("\n%-10s  %-8s  %-12s  %-12s  %-12s  %-12s"
-#if ENERGY
+                #if ENERGY
                "  %-14s"
-#endif
+                #endif
                "\n",
                "Iteration", "Changed", "Upload(ms)", "DPU(ms)",
                "Download(ms)", "Merge(ms)"
-#if ENERGY
+                #if ENERGY
                , "DPU Energy(J)"
-#endif
+                #endif
                );
         printf("----------  --------  ------------  ------------  ------------  ------------"
-#if ENERGY
+        #if ENERGY
                "  --------------"
-#endif
+        #endif
                "\n");
     }
 
@@ -363,7 +358,7 @@ int main(int argc, char **argv)
 
         // do this in parallel 
 
-        
+
         DPU_FOREACH(dpuSet, dpu)
         {
             auto &m = meta[dpuIdx];
@@ -395,21 +390,21 @@ int main(int argc, char **argv)
         totalUploadTime += iterUpload;
 
         //launch
-#if ENERGY
+        #if ENERGY
         DPU_ASSERT(dpu_probe_start(&probe));
-#endif
+        #endif
         double t_dpu0 = now_sec();
         DPU_ASSERT(dpu_launch(dpuSet, DPU_SYNCHRONOUS));
         double iterDPU = now_sec() - t_dpu0;
         totalDPUTime += iterDPU;
-#if ENERGY
+        #if ENERGY
         DPU_ASSERT(dpu_probe_stop(&probe));
         double iterEnergy = 0.0;
         DPU_ASSERT(dpu_probe_get(&probe, DPU_ENERGY, DPU_AVERAGE, &iterEnergy));
         totalDPUEnergy += iterEnergy;
-#endif
+        #endif
 
-        //pull 
+        //pull (This needs to be done in parallel too )
         double t_dl0 = now_sec();
         dpuIdx = 0;
         int change_this_iter = 0;
@@ -452,9 +447,9 @@ int main(int argc, char **argv)
 
         if (verbosity >= 1) {
             printf("%-10u  %-8d  %-12.3f  %-12.3f  %-12.3f  %-12.3f"
-#if ENERGY
+            #if ENERGY
                    "  %-14.6f"
-#endif
+            #endif
                    "\n",
                    iteration,
                    change_this_iter,
@@ -462,9 +457,9 @@ int main(int argc, char **argv)
                    iterDPU      * 1e3,
                    iterDownload * 1e3,
                    totalHostMerge * 1e3
-#if ENERGY
+                #if ENERGY
                    , iterEnergy
-#endif
+                #endif
                    );
         } else {
             // always print iteration progress at v0 so user knows it's running
@@ -487,7 +482,7 @@ int main(int argc, char **argv)
     printf("Total BFS wall time:     %8.3f ms\n", totalBFS          * 1e3);
     printf("==========================\n");
 
-#if ENERGY
+    #if ENERGY
     printf("\n===== ENERGY SUMMARY =====\n");
     if (cpuBFSEnergy >= 0.0)
         printf("CPU-only BFS energy:     %8.4f J\n", cpuBFSEnergy);
@@ -499,7 +494,7 @@ int main(int argc, char **argv)
         printf("Energy ratio (CPU/DPU):  %8.2fx\n", cpuBFSEnergy / totalDPUEnergy);
     printf("==========================\n");
     DPU_ASSERT(dpu_probe_free(&probe));
-#endif
+    #endif
 
     printf("\nConverged in %u iterations\n", iteration);
     verify_levels_only(edges, globalLevel, root);
