@@ -372,6 +372,7 @@ int main(int argc, char **argv)
     do {
         changed = false;
         iteration++;
+        printf(iteration == 1 ? "First iteration — " : "Iteration %u — ", iteration);
 
 
         double t_up0 = now_sec();
@@ -415,6 +416,7 @@ int main(int argc, char **argv)
         totalUploadTime += iterUpload;
 
         //launch
+        printf("Launching DPU kernels...\n");
         #if ENERGY
         DPU_ASSERT(dpu_probe_start(&probe));
         #endif
@@ -434,6 +436,7 @@ int main(int argc, char **argv)
         int change_this_iter = 0;
 
         // Phase 1: all DPUs download in parallel
+        
         {
             std::vector<std::thread> threads;
             threads.reserve(NR_DPUS);
