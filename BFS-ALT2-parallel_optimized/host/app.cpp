@@ -1,15 +1,4 @@
 // app.cpp — Parallel Relaxed Distributed BFS (UPMEM) — Optimised
-//
-// Optimisations over the original:
-//   1. dpu_push_xfer for all uploads: fires transfers to all DPUs in a
-//      single parallel call instead of per-DPU dpu_copy_to.
-//   2. dpu_pull_xfer for all downloads: same for reads.
-//   3. Per-DPU staging buffers padded to a uniform transfer size so
-//      push/pull xfer (which requires equal sizes across DPUs) works
-//      correctly even when DPUs have different node counts.
-//   4. Dirty-set / changed-flag fast-path: only pull levels+parents
-//      from DPUs that report a change.
-//   5. Reused upload/download heap allocations across iterations.
 
 extern "C" {
 #include <dpu.h>
@@ -27,6 +16,9 @@ extern "C" {
 #include <unordered_set>
 #include <vector>
 
+//moved a lot of bloat to here to keep main app.cpp cleaner and more focused on the BFS logic
+#include "../support/gharret_utils.h"
+
 #include "mram-management.h"
 
 #if ENERGY
@@ -35,86 +27,7 @@ extern "C" { #include <dpu_probe.h> }
 
 #define DPU_BINARY  "./bin/dpu_code_local"
 #define NR_DPUS     16
-static const uint32_t INF = UINT32_MAX;
 
-/* ── Helpers ────────────────────────────────────────────────────────────── */
-
-static inline double now_sec() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec + ts.tv_nsec * 1e-9;
-}
-
-static inline uint32_t align_to_8(uint32_t x) { return (x + 7) & ~7u; }
-
-static double rapl_read_uj(const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) return -1.0;
-    unsigned long long uj = 0;
-    fscanf(f, "%llu", &uj);
-    fclose(f);
-    return (double)uj;
-}
-static double rapl_delta_joules(double before, double after, const char *maxp) {
-    if (before < 0 || after < 0) return -1.0;
-    double d = after - before;
-    if (d < 0) { double m = rapl_read_uj(maxp); if (m > 0) d += m; }
-    return d * 1e-6;
-}
-#define RAPL_ENERGY_PATH "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj"
-#define RAPL_MAX_PATH    "/sys/class/powercap/intel-rapl/intel-rapl:0/max_energy_range_uj"
-
-/* ── Types ──────────────────────────────────────────────────────────────── */
-
-struct AlignedU32 { uint32_t value, padding; };
-struct Edge       { uint32_t u, v; };
-
-struct DPUParams {
-    uint32_t numNodes, numEdges;
-    uint32_t localToGlobal_m, edges_m, levels_m, parents_m, changed_m;
-    uint32_t padding;
-};
-
-struct LocalMeta {
-    DPUParams               p;
-    std::vector<uint32_t>   l2g;
-    std::unordered_map<uint32_t,uint32_t> g2l;
-    uint32_t                numNodes;
-    uint32_t                xfer_nodes; // padded node count for uniform xfer size
-};
-
-/* ── Graph loading ──────────────────────────────────────────────────────── */
-
-static void read_edge_list(const char *fn, std::vector<Edge> &edges, uint32_t &maxNode) {
-    FILE *f = fopen(fn, "r");
-    if (!f) { perror("fopen"); exit(1); }
-    uint32_t u, v; maxNode = 0;
-    while (fscanf(f, "%u %u", &u, &v) == 2) {
-        edges.push_back({u,v});
-        maxNode = std::max(maxNode, std::max(u,v));
-    }
-    fclose(f);
-}
-
-/* ── Verification ───────────────────────────────────────────────────────── */
-
-static void verify_levels(const std::vector<Edge> &edges,
-                          const std::vector<AlignedU32> &level,
-                          uint32_t root)
-{
-    int bad = 0; bool ok = true;
-    if (level[root].value != 0) { printf("ERROR: root level != 0\n"); ok = false; }
-    for (auto &e : edges) {
-        if (level[e.u].value == INF || level[e.v].value == INF) continue;
-        if ((uint32_t)abs((int)level[e.u].value-(int)level[e.v].value) > 1) { bad++; ok=false; }
-    }
-    printf("\n===== LEVEL VERIFICATION =====\n");
-    if (ok) printf("LEVELS ARE CONSISTENT\n");
-    else    printf("LEVELS ARE INVALID WITH %d INVALID EDGES\n", bad);
-    printf("==============================\n\n");
-}
-
-/* ── Main ───────────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv)
 {
@@ -128,14 +41,12 @@ int main(int argc, char **argv)
     }
     if (!filename) { printf("usage: %s [-v 0|1|2] edge_list.txt\n",argv[0]); return 1; }
 
-    // ── Load graph ───────────────────────────────────────────────────────
     std::vector<Edge> edges;
     uint32_t maxNode = 0;
     read_edge_list(filename, edges, maxNode);
     uint32_t numGlobalNodes = maxNode + 1;
     printf("Loaded %zu edges, %u nodes\n", edges.size(), numGlobalNodes);
 
-    // ── Partition ────────────────────────────────────────────────────────
     std::vector<uint8_t> nodeDPU(numGlobalNodes);
     for (uint32_t n = 0; n < numGlobalNodes; n++) nodeDPU[n] = n % NR_DPUS;
 
@@ -143,22 +54,16 @@ int main(int argc, char **argv)
     for (auto &e : edges)
         dpuEdges[nodeDPU[std::min(e.u,e.v)]].push_back(e);
 
-    // ── Global BFS state ─────────────────────────────────────────────────
     std::vector<AlignedU32> globalLevel (numGlobalNodes, {INF, 0});
     std::vector<AlignedU32> globalParent(numGlobalNodes, {INF, 0});
     uint32_t root = 0;
     globalLevel[root].value  = 0;
     globalParent[root].value = root;
 
-    // ── Alloc DPUs ───────────────────────────────────────────────────────
     dpu_set_t dpuSet, dpu;
     DPU_ASSERT(dpu_alloc(NR_DPUS, NULL, &dpuSet));
     DPU_ASSERT(dpu_load(dpuSet, DPU_BINARY, NULL));
 
-    // ── Build per-DPU metadata and find the maximum node count ──────────
-    // dpu_push_xfer requires every DPU to receive exactly the same byte
-    // count.  We compute xfer_nodes = max(numNodes across all DPUs) and
-    // pad every staging buffer to that size.
     std::vector<LocalMeta> meta(NR_DPUS);
     uint32_t maxNodes = 0;
 
@@ -179,57 +84,51 @@ int main(int argc, char **argv)
     uint32_t xfer_parents_bytes = xfer_levels_bytes;   // same struct size
     uint32_t xfer_changed_bytes = sizeof(uint64_t);    // always 8 bytes
 
-    // All DPUs use the same MRAM layout (same allocator sequence).
-    // All DPUs share identical MRAM offsets (required for push/pull xfer).
-    // Use maxNodes + maxEdges to fix the layout so every DPU has the same
-    // levels_m, parents_m, changed_m offsets.
-    // Levels/parents/changed must be
-    // at a FIXED offset.  Strategy: place params + l2g + edges first (variable
-    // size per DPU), then levels, parents, changed at fixed offsets computed
-    // from the DPU with the most edges.
     uint32_t maxEdges = 0;
     for (int i = 0; i < NR_DPUS; i++)
         maxEdges = std::max(maxEdges, (uint32_t)dpuEdges[i].size());
 
-    // Recompute the fixed layout using maxNodes and maxEdges so offsets are
-    // identical on every DPU.
     mram_heap_allocator_t fixed_alloc;
     init_allocator(&fixed_alloc);
 
     uint32_t fixed_params_off  = mram_heap_alloc(&fixed_alloc, sizeof(DPUParams));
-    uint32_t fixed_l2g_off     = mram_heap_alloc(&fixed_alloc, align_to_8(maxNodes   * sizeof(uint32_t)));
-    uint32_t fixed_edges_off   = mram_heap_alloc(&fixed_alloc, align_to_8(maxEdges   * sizeof(Edge)));
+    uint32_t fixed_l2g_off     = mram_heap_alloc(&fixed_alloc, align_to_8(maxNodes * sizeof(uint32_t)));
+    uint32_t fixed_edges_off   = mram_heap_alloc(&fixed_alloc, align_to_8(maxEdges * sizeof(Edge)));
     uint32_t fixed_levels_off  = mram_heap_alloc(&fixed_alloc, xfer_levels_bytes);
     uint32_t fixed_parents_off = mram_heap_alloc(&fixed_alloc, xfer_parents_bytes);
     uint32_t fixed_changed_off = mram_heap_alloc(&fixed_alloc, xfer_changed_bytes);
+
+    uint32_t params_row = sizeof(DPUParams);
+    uint32_t l2g_row    = align_to_8(maxNodes * sizeof(uint32_t));
+    uint32_t edges_row  = align_to_8(maxEdges * sizeof(Edge));
+ 
+    std::vector<uint8_t> stageParams(NR_DPUS * params_row,  0);
+    std::vector<uint8_t> stageL2g   (NR_DPUS * l2g_row,     0);
+    std::vector<uint8_t> stageEdges (NR_DPUS * edges_row,   0);
+
+    static_assert(sizeof(DPUParams) % 8 == 0, "DPUParams must be 8-byte aligned");
 
     if (verbosity >= 2) {
         printf("\n===== DPU PARTITION SUMMARY =====\n");
         printf("%-6s  %-10s  %-10s\n","DPU","Nodes","Edges");
         printf("------  ----------  ----------\n");
     }
-
-    // ── Per-DPU staging buffers (padded to xfer size) ────────────────────
-    // Indexed [dpu][node].  Allocated once, reused every iteration.
-    // Size = maxNodes entries so push_xfer transfers the same byte count.
+ 
     std::vector<std::vector<AlignedU32>> stageLevels (NR_DPUS, std::vector<AlignedU32>(maxNodes, {INF,0}));
     std::vector<std::vector<AlignedU32>> stageParents(NR_DPUS, std::vector<AlignedU32>(maxNodes, {INF,0}));
     std::vector<uint64_t>                stageChanged(NR_DPUS, 0);
-
-    // ── Initial load ─────────────────────────────────────────────────────
-    double loadTime = 0.0;
-    dpuIdx = 0;
-    DPU_FOREACH(dpuSet, dpu) {
-        auto &m = meta[dpuIdx];
-        uint32_t numEdges = (uint32_t)dpuEdges[dpuIdx].size();
-
-        // Build local edge list
+ 
+    double t_fill = now_sec();
+ 
+    for (int idx = 0; idx < NR_DPUS; idx++) {
+        auto &m = meta[idx];
+        uint32_t numEdges = (uint32_t)dpuEdges[idx].size();
+ 
         std::vector<Edge> localEdges(numEdges);
         for (uint32_t i = 0; i < numEdges; i++)
-            localEdges[i] = { m.g2l[dpuEdges[dpuIdx][i].u],
-                              m.g2l[dpuEdges[dpuIdx][i].v] };
-
-        // Fill DPUParams with fixed offsets
+            localEdges[i] = { m.g2l[dpuEdges[idx][i].u],
+                              m.g2l[dpuEdges[idx][i].v] };
+ 
         m.p.numNodes        = m.numNodes;
         m.p.numEdges        = numEdges;
         m.p.localToGlobal_m = fixed_l2g_off;
@@ -239,44 +138,64 @@ int main(int argc, char **argv)
         m.p.changed_m       = fixed_changed_off;
         m.p.padding         = 0;
         m.xfer_nodes        = maxNodes;
-
+ 
         if (verbosity >= 2)
-            printf("%-6u  %-10u  %-10u\n", dpuIdx, m.numNodes, numEdges);
-
-        double t0 = now_sec();
-
-        // Params
-        DPU_ASSERT(dpu_copy_to(dpu, DPU_MRAM_HEAP_POINTER_NAME,
-                               fixed_params_off, &m.p, sizeof(DPUParams)));
-
-        // l2g — pad to maxNodes with zeros
-        std::vector<uint32_t> l2g_padded(maxNodes, 0);
-        std::copy(m.l2g.begin(), m.l2g.end(), l2g_padded.begin());
-        DPU_ASSERT(dpu_copy_to(dpu, DPU_MRAM_HEAP_POINTER_NAME,
-                               fixed_l2g_off, l2g_padded.data(),
-                               align_to_8(maxNodes * sizeof(uint32_t))));
-
-        // Edges — pad to maxEdges with {0,0}
-        std::vector<Edge> edges_padded(maxEdges, {0,0});
-        std::copy(localEdges.begin(), localEdges.end(), edges_padded.begin());
-        DPU_ASSERT(dpu_copy_to(dpu, DPU_MRAM_HEAP_POINTER_NAME,
-                               fixed_edges_off, edges_padded.data(),
-                               align_to_8(maxEdges * sizeof(Edge))));
-
-        loadTime += now_sec() - t0;
-        dpuIdx++;
+            printf("%-6u  %-10u  %-10u\n", idx, m.numNodes, numEdges);
+ 
+        std::memcpy(stageParams.data() + idx * params_row,
+                    &m.p, sizeof(DPUParams));
+ 
+        uint32_t *l2g_dst = reinterpret_cast<uint32_t *>(
+            stageL2g.data() + idx * l2g_row);
+        std::copy(m.l2g.begin(), m.l2g.end(), l2g_dst);
+ 
+        Edge *edge_dst = reinterpret_cast<Edge *>(
+            stageEdges.data() + idx * edges_row);
+        std::copy(localEdges.begin(), localEdges.end(), edge_dst);
     }
-
+ 
+    double t_push = now_sec();
+ 
+    { int idx = 0; DPU_FOREACH(dpuSet, dpu) {
+        DPU_ASSERT(dpu_prepare_xfer(dpu, stageParams.data() + idx * params_row));
+        idx++;
+    }}
+    DPU_ASSERT(dpu_push_xfer(dpuSet, DPU_XFER_TO_DPU,
+                              DPU_MRAM_HEAP_POINTER_NAME,
+                              fixed_params_off, params_row,
+                              DPU_XFER_DEFAULT));
+ 
+    { int idx = 0; DPU_FOREACH(dpuSet, dpu) {
+        DPU_ASSERT(dpu_prepare_xfer(dpu, stageL2g.data() + idx * l2g_row));
+        idx++;
+    }}
+    DPU_ASSERT(dpu_push_xfer(dpuSet, DPU_XFER_TO_DPU,
+                              DPU_MRAM_HEAP_POINTER_NAME,
+                              fixed_l2g_off, l2g_row,
+                              DPU_XFER_DEFAULT));
+ 
+    { int idx = 0; DPU_FOREACH(dpuSet, dpu) {
+        DPU_ASSERT(dpu_prepare_xfer(dpu, stageEdges.data() + idx * edges_row));
+        idx++;
+    }}
+    DPU_ASSERT(dpu_push_xfer(dpuSet, DPU_XFER_TO_DPU,
+                              DPU_MRAM_HEAP_POINTER_NAME,
+                              fixed_edges_off, edges_row,
+                              DPU_XFER_DEFAULT));
+ 
+    double loadTime = now_sec() - t_fill;   
+ 
     if (verbosity >= 2) {
         printf("=================================\n");
-        printf("Initial CPU\u2192DPU load time: %.3f ms\n", loadTime * 1e3);
+        printf("CPU fill time:              %8.3f ms\n", (t_push   - t_fill)  * 1e3);
+        printf("push_xfer load (CPU\u2192DPU):   %8.3f ms\n", (now_sec() - t_push) * 1e3);
+        printf("Total initial load:         %8.3f ms\n", loadTime * 1e3);
     }
 
-    // Cache DPU handles for indexed access (needed for push/pull xfer)
     dpu_set_t dpuHandles[NR_DPUS];
     { int idx=0; DPU_FOREACH(dpuSet,dpu) dpuHandles[idx++]=dpu; }
 
-    // ── BFS loop ─────────────────────────────────────────────────────────
+    //  BFS loop 
     bool changed; uint32_t iteration = 0;
     double totalUpload=0, totalDPU=0, totalDownload=0, totalMerge=0;
 
@@ -290,7 +209,7 @@ int main(int argc, char **argv)
         changed = false;
         iteration++;
 
-        // ── Upload levels + parents via push_xfer ─────────────────────
+        //  Upload levels + parents via push_xfer 
         double t_up = now_sec();
 
         // Fill staging buffers
@@ -342,13 +261,13 @@ int main(int argc, char **argv)
 
         totalUpload += now_sec() - t_up;
 
-        // ── Launch ───────────────────────────────────────────────────
+        // Launch 
         double t_dpu = now_sec();
         DPU_ASSERT(dpu_launch(dpuSet, DPU_SYNCHRONOUS));
         double iterDPU = now_sec() - t_dpu;
         totalDPU += iterDPU;
 
-        // ── Download ─────────────────────────────────────────────────
+        // Download 
         double t_dl = now_sec();
 
         // Stage 1: pull changed flags from all DPUs in parallel
@@ -385,7 +304,6 @@ int main(int argc, char **argv)
 
         totalDownload += now_sec() - t_dl;
 
-        // ── Host merge ───────────────────────────────────────────────
         double t_merge = now_sec();
         int change_this_iter = 0;
 
@@ -429,7 +347,15 @@ int main(int argc, char **argv)
 
     printf("\nConverged in %u iterations\n", iteration);
     verify_levels(edges, globalLevel, root);
-
+    if (verbosity >= 3){
+        printf("cpu reference bfs...\n");
+        double t_cpu = now_sec();
+        std::vector<uint32_t> cpuLevel, cpuParent;
+        cpu_bfs(edges, numGlobalNodes, root, cpuLevel, cpuParent);
+        t_cpu = now_sec() - t_cpu;
+        printf("CPU BFS time: %.3f ms\n", t_cpu * 1e3);
+        compare_bfs(globalLevel, cpuLevel, numGlobalNodes);
+    }
     DPU_ASSERT(dpu_free(dpuSet));
     return 0;
 }
