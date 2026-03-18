@@ -20,6 +20,9 @@ extern "C" {
 #include "../support/gharret_utils.h"
 
 #include "mram-management.h"
+#ifndef ENERGY
+#define ENERGY 0
+#endif
 
 #if ENERGY
 extern "C" { #include <dpu_probe.h> }
@@ -280,28 +283,32 @@ int main(int argc, char **argv)
                                  fixed_changed_off, xfer_changed_bytes,
                                  DPU_XFER_DEFAULT));
 
-        // Stage 2: pull levels+parents only from DPUs that changed
-        // (must be done per-DPU since we can't skip inside push_xfer)
+       //stage 2 make subset
         {
-            std::vector<std::thread> threads;
             for (int idx = 0; idx < NR_DPUS; idx++) {
                 if (!stageChanged[idx]) continue;
-                threads.emplace_back([&, idx]() {
-                    DPU_ASSERT(dpu_copy_from(dpuHandles[idx],
-                        DPU_MRAM_HEAP_POINTER_NAME,
-                        fixed_levels_off,
-                        stageLevels[idx].data(),
-                        xfer_levels_bytes));
-                    DPU_ASSERT(dpu_copy_from(dpuHandles[idx],
-                        DPU_MRAM_HEAP_POINTER_NAME,
-                        fixed_parents_off,
-                        stageParents[idx].data(),
-                        xfer_parents_bytes));
-                });
+                DPU_ASSERT(dpu_prepare_xfer(dpuHandles[idx], stageLevels[idx].data()));
             }
-            for (auto &t : threads) t.join();
-        }
+            for (int idx = 0; idx < NR_DPUS; idx++) {
+                if (!stageChanged[idx]) continue;
+                DPU_ASSERT(dpu_push_xfer(dpuHandles[idx], DPU_XFER_FROM_DPU,
+                                        DPU_MRAM_HEAP_POINTER_NAME,
+                                        fixed_levels_off, xfer_levels_bytes,
+                                        DPU_XFER_DEFAULT));
+            }
 
+            for (int idx = 0; idx < NR_DPUS; idx++) {
+                if (!stageChanged[idx]) continue;
+                DPU_ASSERT(dpu_prepare_xfer(dpuHandles[idx], stageParents[idx].data()));
+            }
+            for (int idx = 0; idx < NR_DPUS; idx++) {
+                if (!stageChanged[idx]) continue;
+                DPU_ASSERT(dpu_push_xfer(dpuHandles[idx], DPU_XFER_FROM_DPU,
+                                        DPU_MRAM_HEAP_POINTER_NAME,
+                                        fixed_parents_off, xfer_parents_bytes,
+                                        DPU_XFER_DEFAULT));
+            }
+        }
         totalDownload += now_sec() - t_dl;
 
         double t_merge = now_sec();
