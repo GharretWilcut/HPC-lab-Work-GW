@@ -16,10 +16,9 @@ extern "C" {
 #include <unordered_set>
 #include <vector>
 
-//moved a lot of bloat to here to keep main app.cpp cleaner and more focused on the BFS logic
 #include "../support/gharret_utils.h"
-
 #include "mram-management.h"
+
 #ifndef ENERGY
 #define ENERGY 0
 #endif
@@ -57,11 +56,9 @@ int main(int argc, char **argv)
     for (auto &e : edges)
         dpuEdges[nodeDPU[std::min(e.u,e.v)]].push_back(e);
 
-    std::vector<AlignedU32> globalLevel (numGlobalNodes, {INF, 0});
-    std::vector<AlignedU32> globalParent(numGlobalNodes, {INF, 0});
+    std::vector<AlignedU32> globalLevel(numGlobalNodes, {INF, INF});
     uint32_t root = 0;
-    globalLevel[root].value  = 0;
-    globalParent[root].value = root;
+    globalLevel[root] = {0, root};   // root's parent is itself
 
     dpu_set_t dpuSet, dpu;
     DPU_ASSERT(dpu_alloc(NR_DPUS, NULL, &dpuSet));
@@ -82,9 +79,7 @@ int main(int argc, char **argv)
         dpuIdx++;
     }
 
-    // xfer size in bytes must be 8-byte aligned and identical for all DPUs
     uint32_t xfer_levels_bytes  = align_to_8(maxNodes * sizeof(AlignedU32));
-    uint32_t xfer_parents_bytes = xfer_levels_bytes;   // same struct size
     uint32_t xfer_changed_bytes = sizeof(uint64_t);    // always 8 bytes
 
     uint32_t maxEdges = 0;
@@ -98,7 +93,6 @@ int main(int argc, char **argv)
     uint32_t fixed_l2g_off     = mram_heap_alloc(&fixed_alloc, align_to_8(maxNodes * sizeof(uint32_t)));
     uint32_t fixed_edges_off   = mram_heap_alloc(&fixed_alloc, align_to_8(maxEdges * sizeof(Edge)));
     uint32_t fixed_levels_off  = mram_heap_alloc(&fixed_alloc, xfer_levels_bytes);
-    uint32_t fixed_parents_off = mram_heap_alloc(&fixed_alloc, xfer_parents_bytes);
     uint32_t fixed_changed_off = mram_heap_alloc(&fixed_alloc, xfer_changed_bytes);
 
     uint32_t params_row = sizeof(DPUParams);
@@ -117,8 +111,7 @@ int main(int argc, char **argv)
         printf("------  ----------  ----------\n");
     }
  
-    std::vector<std::vector<AlignedU32>> stageLevels (NR_DPUS, std::vector<AlignedU32>(maxNodes, {INF,0}));
-    std::vector<std::vector<AlignedU32>> stageParents(NR_DPUS, std::vector<AlignedU32>(maxNodes, {INF,0}));
+    std::vector<std::vector<AlignedU32>> stageLevels(NR_DPUS, std::vector<AlignedU32>(maxNodes, {INF, INF}));
     std::vector<uint64_t>                stageChanged(NR_DPUS, 0);
  
     double t_fill = now_sec();
@@ -137,9 +130,7 @@ int main(int argc, char **argv)
         m.p.localToGlobal_m = fixed_l2g_off;
         m.p.edges_m         = fixed_edges_off;
         m.p.levels_m        = fixed_levels_off;
-        m.p.parents_m       = fixed_parents_off;
         m.p.changed_m       = fixed_changed_off;
-        m.p.padding         = 0;
         m.xfer_nodes        = maxNodes;
  
         if (verbosity >= 2)
@@ -212,26 +203,19 @@ int main(int argc, char **argv)
         changed = false;
         iteration++;
 
-        //  Upload levels + parents via push_xfer 
+        //  Upload levels (now carries parent too) via push_xfer
         double t_up = now_sec();
 
-        // Fill staging buffers
         for (int idx = 0; idx < NR_DPUS; idx++) {
             auto &m = meta[idx];
-            // Zero-fill to maxNodes first so padding region is clean
-            std::fill(stageLevels [idx].begin(), stageLevels [idx].end(), AlignedU32{INF,0});
-            std::fill(stageParents[idx].begin(), stageParents[idx].end(), AlignedU32{INF,0});
+            std::fill(stageLevels[idx].begin(), stageLevels[idx].end(), AlignedU32{INF, INF});
             for (uint32_t i = 0; i < m.numNodes; i++) {
                 uint32_t g = m.l2g[i];
-                stageLevels [idx][i] = globalLevel [g];
-                stageParents[idx][i] = globalParent[g];
+                stageLevels[idx][i] = globalLevel[g];  // value+parent in one copy
             }
         }
 
-        // dpu_prepare_xfer associates a host buffer with each DPU,
-        // then dpu_push_xfer fires all transfers in parallel.
-
-        // Push levels
+        // Push levels (which now includes parent data — one xfer instead of two)
         { int idx=0; DPU_FOREACH(dpuSet,dpu) {
             DPU_ASSERT(dpu_prepare_xfer(dpu, stageLevels[idx].data()));
             idx++;
@@ -241,17 +225,6 @@ int main(int argc, char **argv)
                                  fixed_levels_off, xfer_levels_bytes,
                                  DPU_XFER_DEFAULT));
 
-        // Push parents
-        { int idx=0; DPU_FOREACH(dpuSet,dpu) {
-            DPU_ASSERT(dpu_prepare_xfer(dpu, stageParents[idx].data()));
-            idx++;
-        }}
-        DPU_ASSERT(dpu_push_xfer(dpuSet, DPU_XFER_TO_DPU,
-                                 DPU_MRAM_HEAP_POINTER_NAME,
-                                 fixed_parents_off, xfer_parents_bytes,
-                                 DPU_XFER_DEFAULT));
-
-        // Reset and push changed flags
         std::fill(stageChanged.begin(), stageChanged.end(), 0ULL);
         { int idx=0; DPU_FOREACH(dpuSet,dpu) {
             DPU_ASSERT(dpu_prepare_xfer(dpu, &stageChanged[idx]));
@@ -283,7 +256,7 @@ int main(int argc, char **argv)
                                  fixed_changed_off, xfer_changed_bytes,
                                  DPU_XFER_DEFAULT));
 
-       //stage 2 make subset
+        // Stage 2: only pull levels from DPUs that reported a change
         {
             for (int idx = 0; idx < NR_DPUS; idx++) {
                 if (!stageChanged[idx]) continue;
@@ -294,18 +267,6 @@ int main(int argc, char **argv)
                 DPU_ASSERT(dpu_push_xfer(dpuHandles[idx], DPU_XFER_FROM_DPU,
                                         DPU_MRAM_HEAP_POINTER_NAME,
                                         fixed_levels_off, xfer_levels_bytes,
-                                        DPU_XFER_DEFAULT));
-            }
-
-            for (int idx = 0; idx < NR_DPUS; idx++) {
-                if (!stageChanged[idx]) continue;
-                DPU_ASSERT(dpu_prepare_xfer(dpuHandles[idx], stageParents[idx].data()));
-            }
-            for (int idx = 0; idx < NR_DPUS; idx++) {
-                if (!stageChanged[idx]) continue;
-                DPU_ASSERT(dpu_push_xfer(dpuHandles[idx], DPU_XFER_FROM_DPU,
-                                        DPU_MRAM_HEAP_POINTER_NAME,
-                                        fixed_parents_off, xfer_parents_bytes,
                                         DPU_XFER_DEFAULT));
             }
         }
@@ -320,8 +281,7 @@ int main(int argc, char **argv)
             for (uint32_t i = 0; i < m.numNodes; i++) {
                 uint32_t g = m.l2g[i];
                 if (stageLevels[idx][i].value < globalLevel[g].value) {
-                    globalLevel [g] = stageLevels [idx][i];
-                    globalParent[g] = stageParents[idx][i];
+                    globalLevel[g] = stageLevels[idx][i];  // copies value+parent atomically
                     changed = true;
                     change_this_iter++;
                 }

@@ -48,9 +48,12 @@ struct AlignedU32 { uint32_t value, padding; };
 struct Edge       { uint32_t u, v; };
 
 struct DPUParams {
-    uint32_t numNodes, numEdges;
-    uint32_t localToGlobal_m, edges_m, levels_m, parents_m, changed_m;
-    uint32_t padding;
+    uint32_t numNodes;
+    uint32_t numEdges;
+    uint32_t localToGlobal_m;
+    uint32_t edges_m;
+    uint32_t levels_m;
+    uint32_t changed_m;
 };
 
 struct LocalMeta {

@@ -9,7 +9,7 @@
 #include <mutex.h>
  
 #define INF            0xFFFFFFFF
-#define EDGE_BATCH     96      // edges fetched per tasklet per mram_read (
+#define EDGE_BATCH     96      // edges fetched per tasklet per mram_read
  
 BARRIER_INIT(barrier, NR_TASKLETS);
 MUTEX_INIT(fallback_mutex);
@@ -20,13 +20,16 @@ typedef struct {
     uint32_t localToGlobal_m;
     uint32_t edges_m;
     uint32_t levels_m;
-    uint32_t parents_m;
     uint32_t changed_m;
-    uint32_t padding;
 } DPUParams;
  
 typedef struct { uint32_t left,  right;  } Edge;
-typedef struct { uint32_t value, padding; } AlignedU32;
+
+//merged both value and parent to save space and increase speed
+typedef struct { uint32_t value; uint32_t parent; } AlignedU32;
+
+// l2g only needs a plain uint32_t per entry but MRAM reads must be 8-byte
+typedef struct { uint32_t value; uint32_t _pad; } L2GEntry;
  
 static bool shared_change;
  
@@ -40,21 +43,19 @@ int main()
     mram_read((__mram_ptr DPUParams *)DPU_MRAM_HEAP_POINTER,
               &p, sizeof(DPUParams));
  
-    __mram_ptr Edge       *mram_edges   =
-        (__mram_ptr Edge *)      (DPU_MRAM_HEAP_POINTER + p.edges_m);
-    __mram_ptr AlignedU32 *mram_levels  =
+    __mram_ptr Edge      *mram_edges  =
+        (__mram_ptr Edge *)     (DPU_MRAM_HEAP_POINTER + p.edges_m);
+    __mram_ptr AlignedU32 *mram_levels =
         (__mram_ptr AlignedU32 *)(DPU_MRAM_HEAP_POINTER + p.levels_m);
-    __mram_ptr AlignedU32 *mram_parents =
-        (__mram_ptr AlignedU32 *)(DPU_MRAM_HEAP_POINTER + p.parents_m);
-    __mram_ptr AlignedU32 *mram_l2g     =
-        (__mram_ptr AlignedU32 *)(DPU_MRAM_HEAP_POINTER + p.localToGlobal_m);
+    __mram_ptr L2GEntry   *mram_l2g   =
+        (__mram_ptr L2GEntry *)  (DPU_MRAM_HEAP_POINTER + p.localToGlobal_m);
  
     barrier_wait(&barrier);
  
-    Edge       ebuf[EDGE_BATCH] __attribute__((aligned(8)));
-    AlignedU32 lbuf[2]          __attribute__((aligned(8)));
-    AlignedU32 wbuf[1]          __attribute__((aligned(8)));
-    AlignedU32 gbuf[1]          __attribute__((aligned(8)));
+    Edge      ebuf[EDGE_BATCH] __attribute__((aligned(8)));
+    AlignedU32 lbuf[2]         __attribute__((aligned(8)));  // [0]=L, [1]=R
+    AlignedU32 wbuf[1]         __attribute__((aligned(8)));  // write buffer
+    L2GEntry   gbuf[1]         __attribute__((aligned(8)));  // l2g lookup
  
     bool local_change = false;
  
@@ -71,24 +72,25 @@ int main()
             uint32_t L = ebuf[k].left;
             uint32_t R = ebuf[k].right;
  
+            // Single read per node fetches both level and parent in one shot
             mram_read(&mram_levels[L], &lbuf[0], sizeof(AlignedU32));
             mram_read(&mram_levels[R], &lbuf[1], sizeof(AlignedU32));
             uint32_t lvl_L = lbuf[0].value;
             uint32_t lvl_R = lbuf[1].value;
  
-            // Relax L → R
+            // Relax L -> R
             if (lvl_L != INF && lvl_L + 1 < lvl_R) {
                 mutex_lock(fallback_mutex);
+                // Re-read under lock to avoid races
                 mram_read(&mram_levels[R], wbuf, sizeof(AlignedU32));
                 mram_read(&mram_levels[L], &lbuf[0], sizeof(AlignedU32));
                 lvl_L = lbuf[0].value;
                 if (lvl_L != INF && lvl_L + 1 < wbuf[0].value) {
-                    wbuf[0].value   = lvl_L + 1;
-                    wbuf[0].padding = 0;
+                    // Fetch L's global ID to store as R's parent
+                    mram_read(&mram_l2g[L], gbuf, sizeof(L2GEntry));
+                    wbuf[0].value  = lvl_L + 1;
+                    wbuf[0].parent = gbuf[0].value;  // packed into same write
                     mram_write(wbuf, &mram_levels[R], sizeof(AlignedU32));
-                    mram_read(&mram_l2g[L], gbuf, sizeof(AlignedU32));
-                    gbuf[0].padding = 0;
-                    mram_write(gbuf, &mram_parents[R], sizeof(AlignedU32));
                     local_change = true;
                 }
                 mutex_unlock(fallback_mutex);
@@ -100,19 +102,17 @@ int main()
             lvl_L = lbuf[0].value;
             lvl_R = lbuf[1].value;
  
-            // Relax R → L
+            // Relax R -> L
             if (lvl_R != INF && lvl_R + 1 < lvl_L) {
                 mutex_lock(fallback_mutex);
                 mram_read(&mram_levels[L], wbuf, sizeof(AlignedU32));
                 mram_read(&mram_levels[R], &lbuf[1], sizeof(AlignedU32));
                 lvl_R = lbuf[1].value;
                 if (lvl_R != INF && lvl_R + 1 < wbuf[0].value) {
-                    wbuf[0].value   = lvl_R + 1;
-                    wbuf[0].padding = 0;
+                    mram_read(&mram_l2g[R], gbuf, sizeof(L2GEntry));
+                    wbuf[0].value  = lvl_R + 1;
+                    wbuf[0].parent = gbuf[0].value;  // packed into same write
                     mram_write(wbuf, &mram_levels[L], sizeof(AlignedU32));
-                    mram_read(&mram_l2g[R], gbuf, sizeof(AlignedU32));
-                    gbuf[0].padding = 0;
-                    mram_write(gbuf, &mram_parents[L], sizeof(AlignedU32));
                     local_change = true;
                 }
                 mutex_unlock(fallback_mutex);
@@ -135,8 +135,8 @@ int main()
  
     if (id == 0) {
         AlignedU32 out __attribute__((aligned(8)));
-        out.value   = shared_change ? 1 : 0;
-        out.padding = 0;
+        out.value  = shared_change ? 1 : 0;
+        out.parent = 0;
         mram_write(&out,
                    (__mram_ptr AlignedU32 *)(DPU_MRAM_HEAP_POINTER + p.changed_m),
                    sizeof(AlignedU32));
