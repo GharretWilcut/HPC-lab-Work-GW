@@ -9,7 +9,7 @@ static void usage() {
     PRINT(  "\nUsage:  ./program [options]"
             "\n"
             "\nBenchmark-specific options:"
-            "\n    -f <F>    input matrix file name (default=data/loc-gowalla_edges.txt.txt)"
+            "\n    -f <F>    input matrix file name (default=data/roadNet-CA.txt)"
             "\n"
             "\nGeneral options:"
             "\n    -v <V>    verbosity"
@@ -24,7 +24,7 @@ typedef struct Params {
 
 static struct Params input_params(int argc, char **argv) {
     struct Params p;
-    p.fileName      = "data/loc-gowalla_edges.txt";
+    p.fileName      = "data/roadNet-CA.txt";
     p.verbosity     = 1;
     int opt;
     while((opt = getopt(argc, argv, "f:v:h")) >= 0) {

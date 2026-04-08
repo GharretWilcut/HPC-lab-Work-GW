@@ -29,8 +29,8 @@ extern "C" {
 }
 #endif
 
-#define DPU_BINARY  "./bin/dpu_code_local"
-#define NR_DPUS     16
+#define DPU_BINARY  "./bin/dpu_code"
+#define NR_DPUS     64
 
 
 int main(int argc, char **argv)
