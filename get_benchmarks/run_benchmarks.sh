@@ -12,7 +12,7 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 BFS_DIR="$SCRIPT_DIR/BFS-CPP"
-BFSALT_DIR="$SCRIPT_DIR/BFS-ALT3"
+BFSALT_DIR="$SCRIPT_DIR/BFS-ALT5"
 DATA_DIR="$SCRIPT_DIR/data"
 RESULTS_DIR="$SCRIPT_DIR/bfs_bench_results"
 
@@ -142,7 +142,7 @@ run_alt3() {
 
     {
         TIMEFORMAT='%R'
-        { time (cd "$BFSALT_DIR" && "$BFSALT_BIN" -v 2 "$GRAPH" 2>&1; echo $? > /tmp/_bfs_exit_$$) > "$TMPOUT"; } 2>"$TMPTIME"
+        { time (cd "$BFSALT_DIR" && "$BFSALT_BIN" -v 0 "$GRAPH" 2>&1; echo $? > /tmp/_bfs_exit_$$) > "$TMPOUT"; } 2>"$TMPTIME"
         EXIT_CODE=$(cat /tmp/_bfs_exit_$$)
     }
     WALL_SEC=$(cat "$TMPTIME")

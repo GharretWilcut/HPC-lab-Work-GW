@@ -2,7 +2,7 @@
 
 # Configuration
 NR_TASKLETS ?= 16
-NR_DPUS ?= 64
+NR_DPUS ?= 512
 
 # Compiler settings
 DPU_CC = dpu-upmem-dpurte-clang

@@ -2,18 +2,18 @@
 """
 Synthetic graph data generator.
 Produces large graphs in the format:
+    <num_nodes> <num_nodes> <num_edges>   ← header line
     <src>\t<dst>
     <src>\t<dst>
     ...
-(no header line — compatible with read_edge_list in gharret_utils.h)
 
 Usage:
-    python3 graph_gen.py [options]
+    python3 create_graph.py [options]
 
 Examples:
-    python3 graph_gen.py --nodes 1000000 --edges 10000000 --unreachable 0.1 --out graph.txt
-    python3 graph_gen.py --nodes 500000  --edges 50000000 --type scale_free --out big.txt
-    python3 graph_gen.py --nodes 200000  --edges 5000000  --type grid --out grid.txt
+    python3 create_graph.py --nodes 1000000 --edges 10000000 --unreachable 0.1 --out graph.txt
+    python3 create_graph.py --nodes 500000  --edges 50000000 --type scale_free --out big.txt
+    python3 create_graph.py --nodes 200000  --edges 5000000  --type grid --out grid.txt
 """
 
 import argparse
@@ -182,13 +182,15 @@ def write_graph(out_file, num_nodes, num_edges, gen, dedup, verbose):
     if dedup and verbose and collected != num_edges:
         print(f"  (dedup removed {num_edges - collected:,} duplicate edges)")
 
-    # --- Phase 2: write in ascending source-node order ---
+    # --- Phase 2: write header then edges in ascending source-node order ---
     if verbose:
         print("  Phase 2/2: writing sorted output...", flush=True)
 
     actual_edges = 0
     with open(out_file, 'w') as f:
-        # No header — read_edge_list in app.cpp scans raw "u v" pairs only
+        # Header line: num_nodes num_nodes num_edges
+        f.write(f"{num_nodes} {num_nodes} {collected}\n")
+
         for src in range(num_nodes):
             if src not in buckets:
                 continue

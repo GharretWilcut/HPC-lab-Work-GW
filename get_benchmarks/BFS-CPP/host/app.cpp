@@ -342,7 +342,7 @@ int main(int argc,char**argv){
         PRINT("CPU-DPU Time(ms): %f    DPU Kernel Time (ms): %f    Inter-DPU Time (ms): %f    DPU-CPU Time (ms): %f", 
               loadTime*1e3, dpuTime*1e3, hostTime*1e3, retrieveTime*1e3);
     }
-
+    if (params.verbosity > 1) {
     // Calculating result on CPU
     PRINT_INFO(params.verbosity >= 1, "Calculating result on CPU");
     uint32_t* nodeLevelReference = static_cast<uint32_t*>(calloc(numNodes, sizeof(uint32_t)));
@@ -398,7 +398,9 @@ int main(int argc,char**argv){
                        nodeIdx, nodeLevelReference[nodeIdx], nodeLevel[nodeIdx]);
         }
     }
+        free(nodeLevelReference);
 
+    }
     // Display DPU Logs (if any exist)
     if(params.verbosity >= 2) {
         PRINT_INFO(params.verbosity >= 2, "Displaying DPU Logs:");
@@ -419,7 +421,7 @@ int main(int argc,char**argv){
     free(visited);
     free(currentFrontier);
     free(nextFrontier);
-    free(nodeLevelReference);
+
 
     DPU_ASSERT(dpu_free(dpuSet));
 
