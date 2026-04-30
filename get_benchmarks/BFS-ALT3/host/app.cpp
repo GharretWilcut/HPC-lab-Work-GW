@@ -30,7 +30,7 @@ extern "C" {
 #endif
 
 #define DPU_BINARY  "./bin/dpu_code"
-#define NR_DPUS     64
+#define NR_DPUS     512
 
 
 int main(int argc, char **argv)
@@ -51,7 +51,7 @@ int main(int argc, char **argv)
     uint32_t numGlobalNodes = maxNode + 1;
     printf("Loaded %zu edges, %u nodes\n", edges.size(), numGlobalNodes);
 
-    std::vector<uint8_t> nodeDPU(numGlobalNodes);
+    std::vector<uint32_t> nodeDPU(numGlobalNodes);
     for (uint32_t n = 0; n < numGlobalNodes; n++) nodeDPU[n] = n % NR_DPUS;
 
     std::vector<std::vector<Edge>> dpuEdges(NR_DPUS);
@@ -315,7 +315,9 @@ int main(int argc, char **argv)
     printf("==========================\n");
 
     printf("\nConverged in %u iterations\n", iteration);
+    if (verbosity >= 1){
     verify_levels(edges, globalLevel, root);
+    }
     if (verbosity >= 3){
         printf("cpu reference bfs...\n");
         double t_cpu = now_sec();

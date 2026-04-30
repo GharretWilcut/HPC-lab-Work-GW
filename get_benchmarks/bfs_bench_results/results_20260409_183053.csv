@@ -1,0 +1,7 @@
+impl,graph,graph_size_mb,run,exit_code,wall_time_ms,cpu_dpu_ms,dpu_kernel_ms,inter_dpu_ms,dpu_cpu_ms
+BFS,Graph_1.txt,122,1,0,3128.00,180.503875,59.423000,250.961006,11.446000
+BFS-ALT3,Graph_1.txt,122,1,0,6658.00,N/A,N/A,N/A,N/A
+BFS,Graph_1.txt,122,2,0,3160.00,191.635966,59.335001,257.784992,11.771000
+BFS-ALT3,Graph_1.txt,122,2,0,6665.00,N/A,N/A,N/A,N/A
+BFS,Graph_1.txt,122,3,0,3133.00,186.868966,59.390999,242.285997,11.169000
+BFS-ALT3,Graph_1.txt,122,3,0,6690.00,N/A,N/A,N/A,N/A

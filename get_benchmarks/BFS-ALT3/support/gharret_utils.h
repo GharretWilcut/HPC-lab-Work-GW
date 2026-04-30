@@ -63,10 +63,23 @@ struct LocalMeta {
 static void read_edge_list(const char *fn, std::vector<Edge> &edges, uint32_t &maxNode) {
     FILE *f = fopen(fn, "r");
     if (!f) { perror("fopen"); exit(1); }
-    uint32_t u, v; maxNode = 0;
+ 
+    uint32_t a, b, c;
+    long first_line_end = 0;
+    if (fscanf(f, "%u %u %u", &a, &b, &c) == 3) {
+        maxNode = a - 1;         
+        edges.reserve(c);
+        first_line_end = ftell(f);
+    } else {
+        rewind(f);
+        maxNode = 0;
+    }
+ 
+    uint32_t u, v;
     while (fscanf(f, "%u %u", &u, &v) == 2) {
-        edges.push_back({u,v});
-        maxNode = std::max(maxNode, std::max(u,v));
+        edges.push_back({u, v});
+        if (first_line_end == 0)
+            maxNode = std::max(maxNode, std::max(u, v));
     }
     fclose(f);
 }

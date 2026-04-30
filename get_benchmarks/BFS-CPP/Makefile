@@ -4,7 +4,7 @@ BUILDDIR ?= bin
 
 NR_TASKLETS ?= 16
 BL ?= 10
-NR_DPUS ?= 64
+NR_DPUS ?= 512
 TYPE ?= INT32
 ENERGY ?= 0
 
