@@ -21,7 +21,7 @@ fi
 # --- Paths ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BFS_DIR="$SCRIPT_DIR/BFS-CPP"
-BFSALT_DIR="$SCRIPT_DIR/BFS-ALT5"
+BFSALT_DIR="$SCRIPT_DIR/BFS-CSR"
 
 BFS_BIN="$BFS_DIR/bin/host_code"
 BFSALT_BIN="$BFSALT_DIR/bin/app_local"
@@ -33,7 +33,7 @@ TMPTIME="/tmp/_bfs_time_$$"
 echo "[BUILD] BFS..."
 make -C "$BFS_DIR" || exit 1
 
-echo "[BUILD] BFS-ALT5..."
+echo "[BUILD] BFS-CSR..."
 make -C "$BFSALT_DIR" || exit 1
 echo ""
 
@@ -87,7 +87,7 @@ run_and_print() {
 
 # --- Run both ---
 run_and_print "BFS"      "cd $BFS_DIR && $BFS_BIN -v 0 -f $GRAPH"
-run_and_print "BFS-ALT5" "cd $BFSALT_DIR && $BFSALT_BIN -v 0 $GRAPH"
+run_and_print "BFS-CSR" "cd $BFSALT_DIR && $BFSALT_BIN -v 0 $GRAPH"
 
 # --- Cleanup ---
 rm -f "$TMPOUT" "$TMPTIME"

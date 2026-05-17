@@ -1,0 +1,194 @@
+
+extern "C" {
+#include <dpu.h>
+#include <dpu_log.h>
+}
+
+
+#include <queue>
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+static const uint32_t INF = UINT32_MAX;
+
+
+static inline double now_sec() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+static inline uint32_t align_to_8(uint32_t x) { return (x + 7) & ~7u; }
+
+static double rapl_read_uj(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1.0;
+    unsigned long long uj = 0;
+    fscanf(f, "%llu", &uj);
+    fclose(f);
+    return (double)uj;
+}
+
+#define RAPL_ENERGY_PATH "/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj"
+#define RAPL_MAX_PATH    "/sys/class/powercap/intel-rapl/intel-rapl:0/max_energy_range_uj"
+
+// need to redo aligned U32 struct to better utilize the 8-byte aligned xfers and avoid padding waste
+struct AlignedU32 { uint32_t value, parent; };
+struct Edge       { uint32_t u, v; };
+
+typedef struct {
+    uint32_t numNodes;          // local node count for this DPU
+    uint32_t numEdges;          // local edge count (kept for info/debug)
+    uint32_t localToGlobal_m;   // MRAM offset: uint32_t[numNodes]  (l2g map)
+    uint32_t nodePtrs_m;        // MRAM offset: uint32_t[numNodes+1] (CSR row ptrs)
+    uint32_t neighborIdxs_m;    // MRAM offset: uint32_t[numEdges]   (CSR col idxs)
+    uint32_t levels_m;          // MRAM offset: AlignedU32[numNodes]
+    uint32_t changed_m;         // MRAM offset: AlignedU32[1]
+    uint32_t _pad;              // keep struct size a multiple of 8
+} DPUParams;
+struct LocalMeta {
+    std::unordered_map<uint32_t,uint32_t> g2l;
+    std::vector<uint32_t>                 l2g;
+    uint32_t numNodes = 0;
+    uint32_t numEdges = 0;       // local edge count (directed, after remapping)
+
+    // Local CSR built from the remapped edges
+    std::vector<uint32_t> nodePtrs;      // size numNodes+1
+    std::vector<uint32_t> neighborIdxs; // size numEdges
+
+    DPUParams p = {};
+    uint32_t  xfer_nodes = 0;
+};
+
+
+static void read_edge_list(const char *fn, std::vector<Edge> &edges, uint32_t &maxNode) {
+    FILE *f = fopen(fn, "r");
+    if (!f) { perror("fopen"); exit(1); }
+ 
+    uint32_t a, b, c;
+    long first_line_end = 0;
+    if (fscanf(f, "%u %u %u", &a, &b, &c) == 3) {
+        maxNode = a - 1;         
+        edges.reserve(c);
+        first_line_end = ftell(f);
+    } else {
+        rewind(f);
+        maxNode = 0;
+    }
+ 
+    uint32_t u, v;
+    while (fscanf(f, "%u %u", &u, &v) == 2) {
+        edges.push_back({u, v});
+        if (first_line_end == 0)
+            maxNode = std::max(maxNode, std::max(u, v));
+    }
+    fclose(f);
+}
+
+// only verifies that levels are consistent not bfs accurate (i.e. no level should differ by more than 1 from its neighbors)
+static void verify_levels(const std::vector<Edge> &edges,
+                          const std::vector<AlignedU32> &level,
+                          uint32_t root)
+{
+    int bad = 0; bool ok = true;
+    if (level[root].value != 0) { printf("ERROR: root level != 0\n"); ok = false; }
+    for (auto &e : edges) {
+        if (level[e.u].value == INF || level[e.v].value == INF) continue;
+        if ((uint32_t)abs((int)level[e.u].value-(int)level[e.v].value) > 1) { bad++; ok=false; }
+    }
+    printf("\n===== LEVEL VERIFICATION =====\n");
+    if (ok) printf("LEVELS ARE CONSISTENT\n");
+    else    printf("LEVELS ARE INVALID WITH %d INVALID EDGES\n", bad);
+    printf("==============================\n\n");
+}
+
+static void cpu_bfs(const std::vector<Edge> &edges,
+                    uint32_t numNodes, uint32_t root,
+                    std::vector<uint32_t> &outLevel,
+                    std::vector<uint32_t> &outParent)
+{
+    std::vector<std::vector<uint32_t>> adj(numNodes);
+    for (auto &e : edges){
+        adj[e.u].push_back(e.v);
+        adj[e.v].push_back(e.u);
+    }
+
+    outLevel.assign(numNodes,INF);
+    outParent.assign(numNodes,INF);
+    outLevel[root] = 0;
+    outParent[root] = root;
+
+    std::vector<uint32_t> queue;
+    queue.reserve(numNodes);
+    queue.push_back(root);
+
+    for (size_t head =0; head < queue.size();head++){
+        uint32_t u = queue[head];
+        for (uint32_t v : adj[u]){
+            if (outLevel[v] == INF){
+                outLevel[v] = outLevel[u]+1;
+                outParent[v]=u;
+                queue.push_back(v);
+            }
+        }
+    }
+} 
+
+static void cpu_bfs_csr(
+    const CSRGraph &csr,
+    uint32_t root,
+    std::vector<uint32_t> &level,
+    std::vector<uint32_t> &parent)
+{
+    level.assign(csr.numNodes, INF);
+    parent.assign(csr.numNodes, INF);
+
+    std::queue<uint32_t> q;
+
+    level[root] = 0;
+    parent[root] = root;
+
+    q.push(root);
+
+    while (!q.empty()) {
+        uint32_t u = q.front();
+        q.pop();
+
+        for (uint32_t ptr = csr.nodePtrs[u];
+             ptr < csr.nodePtrs[u + 1];
+             ptr++)
+        {
+            uint32_t v = csr.neighborIdxs[ptr];
+
+            if (level[v] == INF) {
+                level[v] = level[u] + 1;
+                parent[v] = u;
+                q.push(v);
+            }
+        }
+    }
+}
+
+static void compare_bfs(const std::vector<AlignedU32> &dpuLevel,
+                        const std::vector<uint32_t> &cpuLevel, uint32_t numNodes)
+{
+    uint32_t mismatches = 0,dpu_inf  = 0, cpu_inf =0, both_inf = 0;
+
+    for (uint32_t n = 0; n < numNodes; n++){
+        bool dpu_unreachable = (dpuLevel[n].value == INF);
+        bool cpu_unreachable = (cpuLevel[n] == INF);
+        if (dpu_unreachable && cpu_unreachable) { both_inf++; continue; }
+        if (dpu_unreachable) {dpu_inf++; mismatches++; continue;}
+        if (cpu_unreachable) {cpu_inf++; mismatches++; continue;}
+        if (dpuLevel[n].value != cpuLevel[n]) mismatches++;
+    }
+    printf("Mismatches: %u, DPU Inf: %u, CPU Inf: %u, Both Inf: %u\n", mismatches, dpu_inf, cpu_inf, both_inf);
+}
