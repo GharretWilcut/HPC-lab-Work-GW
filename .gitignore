@@ -1,2 +1,3 @@
 *.txt
 **/*.txt   get_benchmarks/**/data/
+get_benchmarks/**/data/
